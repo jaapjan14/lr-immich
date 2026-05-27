@@ -22,7 +22,7 @@ return {
 
     LrToolkitIdentifier = 'com.lakatua.lr-immich',
     LrPluginName        = 'lr-immich (Immich publish)',
-    LrPluginInfoUrl     = 'https://github.com/lakatua/lr-immich',
+    LrPluginInfoUrl     = 'https://github.com/jaapjan14/lr-immich',
 
     LrExportServiceProvider = {
         title = 'Immich (lr-immich)',
