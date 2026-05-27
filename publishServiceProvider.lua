@@ -25,7 +25,7 @@ local LOG_PATH = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.7.0] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.8.0] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -886,22 +886,66 @@ function provider.processRenderedPhotos(functionContext, exportContext)
         log('    name: ' .. tostring(publishedCollection:getName()))
     end
 
-    -- Build (photo.localIdentifier → remoteId) lookup
+    -- Build (photo.localIdentifier → remoteId) lookup.
+    -- v0.8.0: scan the ENTIRE publish service, not just the collection being
+    -- published. LR tracks published-state per collection, so a photo synced
+    -- through one collection (e.g. the default 'z8-immich') has no published
+    -- record in a sibling smart collection ('tag-z8-immich'). Without this,
+    -- publishing the smart collection would route already-synced photos to
+    -- UPLOAD-NEW and duplicate them in Immich. Harvesting every collection in
+    -- the service lets us find the existing remoteId wherever it lives, route
+    -- the photo to metadata-only/replace (UUID preserved), and let LR record
+    -- the published-state in the current collection via recordPublishedPhotoId.
     local remoteIdByPhotoId = {}
     local cachedCount = 0
-    if publishedCollection then
-        local pubPhotos = publishedCollection:getPublishedPhotos()
-        log('  publishedCollection:getPublishedPhotos() returned ' .. tostring(#pubPhotos) .. ' rows')
+
+    -- Pull (photo → remoteId) from one collection into the lookup. First
+    -- writer wins, so the collection being published is harvested first and
+    -- its own remoteIds take precedence over a sibling's.
+    local function harvest(coll, label)
+        if not coll then return end
+        local pubPhotos = coll:getPublishedPhotos()
+        local added = 0
         for _, pp in ipairs(pubPhotos) do
             local p = pp:getPhoto()
             local rid = pp:getRemoteId()
-            if p and rid then
-                remoteIdByPhotoId[p.localIdentifier or 0] = rid
-                cachedCount = cachedCount + 1
+            if p and rid and rid ~= '' then
+                local key = p.localIdentifier or 0
+                if not remoteIdByPhotoId[key] then
+                    remoteIdByPhotoId[key] = rid
+                    cachedCount = cachedCount + 1
+                    added = added + 1
+                end
+            end
+        end
+        log(string.format('  harvested %d new remoteIds from %q (%d published rows)',
+            added, tostring(label), #pubPhotos))
+    end
+
+    -- Recursively gather every published collection under a service/set node.
+    -- Call the SDK methods directly (no pcall) — they yield internally and a
+    -- pcall boundary triggers "Yielding is not allowed within a C call".
+    local function gatherCollections(node, acc)
+        local colls = node:getChildCollections()
+        if colls then for _, c in ipairs(colls) do acc[#acc + 1] = c end end
+        local sets = node:getChildCollectionSets()
+        if sets then for _, s in ipairs(sets) do gatherCollections(s, acc) end end
+    end
+
+    if publishedCollection then
+        harvest(publishedCollection, publishedCollection:getName())  -- current first
+        local service = publishedCollection:getService()
+        if service then
+            local all = {}
+            gatherCollections(service, all)
+            for _, c in ipairs(all) do
+                if c.localIdentifier ~= publishedCollection.localIdentifier then
+                    harvest(c, c:getName())
+                end
             end
         end
     end
-    log('  cached ' .. cachedCount .. ' photoId→remoteId mappings')
+    log('  cached ' .. cachedCount .. ' photoId→remoteId mappings (service-wide)')
 
     -- Accumulate successfully-replaced photo ids; we'll clear their
     -- photoNeedsUpdating flags in ONE sqlite3 call after the loop ends.

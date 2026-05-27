@@ -15,6 +15,10 @@
 # OS thumbnails
 Thumbs.db
 
+# Pre-edit backups (e.g. publishServiceProvider.lua.bak-pre-*-YYYYMMDD-HHMMSS)
+*.bak
+*.bak-*
+
 # Sidecar state lives OUTSIDE the plugin folder
 # (~/Library/Application Support/lr-immich/signatures.lua)
 # but if anyone ever drops it in here by accident, don't commit it.

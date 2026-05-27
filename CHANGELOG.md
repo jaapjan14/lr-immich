@@ -1,5 +1,44 @@
 # lr-immich changelog
 
+## 0.8.0 — 2026-05-26
+
+Service-wide remoteId lookup. Fixes already-synced photos appearing as
+"New Photos to Publish" (and re-uploading as duplicates) when published
+through a *different* collection of the same publish service than the
+one they were originally synced through.
+
+Background:
+LR tracks published-state per collection. The 2026-Digital catalog has
+two collections under the Immich service: `z8-immich` (default) and
+`tag-z8-immich` (keyword smart collection). All actual syncing — original,
+the post-keyword re-sync, and the 2026-05-26 disaster recovery — ran
+through `z8-immich`, so its ledger holds the 224 records. The plugin log
+confirms `tag-z8-immich` was *never* published through: its ledger was
+empty from creation, so it showed all 240 matching photos as "new" even
+though 224 were already in Immich. `processRenderedPhotos` built its
+`remoteIdByPhotoId` lookup solely from `publishedCollection:getPublishedPhotos()`
+(the collection being published), found nothing in `tag-z8-immich`, and
+would have routed all 224 already-in-Immich photos to UPLOAD-NEW →
+duplicates.
+
+Fix: the lookup now harvests `getPublishedPhotos()` from EVERY collection
+in the service (walks `getService()` → `getChildCollections()` /
+`getChildCollectionSets()` recursively; current collection harvested
+first so it wins ties). Already-synced photos are found wherever their
+record lives, route to metadata-only/replace (UUID preserved, no
+duplicate), and LR records the published-state into the current
+collection via `recordPublishedPhotoId` — the corruption-free way to
+re-link, unlike hand-editing AgRemotePhoto/AgLibraryPublishedCollectionImage
+directly (which LR rejects as a corrupt catalog; tried and reverted from
+backup earlier the same day).
+
+Verified 2026-05-26: published `tag-z8-immich` → `224 metadata · 16 new`.
+Immich owner active count 3741 → 3757 (+16, no duplicates); all 224
+original UUIDs still single and active; the 16 genuinely-new uploaded
+clean. Tested on one photo (`_DSC2803`) via a throwaway `ztest`
+collection first — log showed the service-wide harvest finding its
+remoteId in `z8-immich` and routing METADATA-ONLY, Immich count unchanged.
+
 ## 0.7.0 — 2026-05-19
 
 Title sync to Darkroom. Closes the gap left open by v0.5.0's
