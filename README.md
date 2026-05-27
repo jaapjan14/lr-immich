@@ -4,6 +4,8 @@ A Lightroom Classic publish service that sends photos directly to
 [Immich](https://immich.app), with the metadata-republish behavior
 Adobe's built-in "Hard Drive" provider was supposed to have.
 
+![Publishing Manager — Immich connection settings; the API key lives in the macOS keychain, not the catalog](screenshots/publishing-manager.png)
+
 ## The problem this solves
 
 Adobe's built-in publish providers hard-code their republish triggers
@@ -80,6 +82,8 @@ sidecar at `~/Library/Application Support/lr-immich/signatures.lua`.
 5. Click **Test Connection** to verify. Then **Save**.
 
 ## Workflow
+
+![The publish service in Lightroom's Publish panel, with a smart collection queued for publishing](screenshots/publish-services.png)
 
 The plugin ships with a single publish service. Add photos to it the
 same way you would with any LR publish service:
