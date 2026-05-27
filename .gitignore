@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+._*
+
+# Lightroom Classic creates these inside loaded plugin folders
+*.lrSdkCache
+*.lrpkg
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS thumbnails
+Thumbs.db
+
+# Sidecar state lives OUTSIDE the plugin folder
+# (~/Library/Application Support/lr-immich/signatures.lua)
+# but if anyone ever drops it in here by accident, don't commit it.
+signatures.lua
+state/
