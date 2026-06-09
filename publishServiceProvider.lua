@@ -25,7 +25,7 @@ local LOG_PATH = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.8.0] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.9.1] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -294,6 +294,36 @@ local function shellEscape(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
+-- Run an external command via LrTasks.execute, surviving the macOS
+-- fork()-on-child-side crash. When LR forks to spawn a command, the child
+-- can SIGSEGV before exec because the ObjC/XPC runtime isn't fork-safe
+-- (the 2026-06-08 incident: 7 such crashes in a single publish, stack
+-- ending in fork → libSystem_atfork_child → objc_class::realizeIfNeeded).
+-- The command never ran, so a retry almost always succeeds — the race is
+-- intermittent. Every caller here runs an IDEMPOTENT command (multipart
+-- PUT replace of the same bytes, `mkdir -p`, an `UPDATE ... SET
+-- photoNeedsUpdating=0`), so retrying a genuine failure is harmless too.
+-- Returns the final rc (0 = success). v0.9.0.
+local function execResilient(cmd, label, tries)
+    tries = tries or 3
+    local rc = 0
+    for attempt = 1, tries do
+        rc = LrTasks.execute(cmd)
+        if rc == 0 then
+            if attempt > 1 then
+                log(string.format('  execResilient[%s]: succeeded on attempt %d/%d',
+                    tostring(label), attempt, tries))
+            end
+            return 0
+        end
+        log(string.format('  execResilient[%s]: attempt %d/%d rc=%d%s',
+            tostring(label), attempt, tries, rc,
+            attempt < tries and ' — retrying' or ' — giving up'))
+        if attempt < tries then LrTasks.sleep(0.2 * attempt) end
+    end
+    return rc
+end
+
 ----------------------------------------------------------------------------
 -- Signature sidecar store (v0.6.1)
 --
@@ -351,7 +381,7 @@ local function saveSignatures()
     if not _sigCache then return true end
     -- Ensure parent dir exists. Use mkdir -p via shell — LR's
     -- LrFileUtils.createAllDirectories may yield in weird contexts.
-    LrTasks.execute('/bin/mkdir -p ' .. shellEscape(SIG_DIR))
+    execResilient('/bin/mkdir -p ' .. shellEscape(SIG_DIR), 'mkdir sigdir')
 
     local f, err = io.open(SIG_PATH, 'w')
     if not f then
@@ -384,19 +414,31 @@ local function setSignature(photoId, sig)
 end
 
 ----------------------------------------------------------------------------
--- curl helper (v0.6.1)
+-- JSON API helper (v0.9.0 — native LrHttp, no fork)
 --
--- Returns (httpStatusCode, responseBody). On network/curl error returns
--- (0, errorText). Crucially this is NOT `curl -f` — v0.6.0 used -f and
--- discarded HTTP-4xx response bodies, which cost us hours diagnosing
--- "exit 56 HTTP 400" without seeing Immich's actual error message.
+-- Was a curl shell-out (v0.6.1) — every LR fork() to run curl could crash
+-- on the child side (macOS ObjC runtime isn't fork-safe; the 2026-06-08
+-- incident). These small JSON calls (tag list/create, tag link, asset GET,
+-- metadata PATCH, title push) were the BULK of our forks, so moving them
+-- in-process via LrHttp removes most of the crash surface. (DELETE/unlink
+-- is the one exception — see curlJsonShell.)
+--
+-- Same return contract as the curl version: (httpStatusCode, responseBody).
+-- On a transport-level failure (DNS, refused, timeout) returns (0, errText).
+-- Like the old NOT-`-f` curl, HTTP 4xx/5xx still return their status AND
+-- body so callers can surface Immich's real error message.
 ----------------------------------------------------------------------------
 
-local function curlJson(method, url, apiKey, jsonBody)
+-- curl shell-out fallback, used only for DELETE-with-body (tag unlink).
+-- LrHttp's handling of a request body on DELETE is unverified and Immich's
+-- DELETE /api/tags/{id}/assets REQUIRES the {"ids":[...]} body, so we keep
+-- DELETE on curl to avoid a silent tag-removal regression — but wrapped in
+-- execResilient so a fork-child crash retries instead of failing. Rare path
+-- (only fires when a keyword is removed from a published photo). NOT `-f`,
+-- so curl exits 0 on HTTP 4xx and we still capture status + body.
+local function curlJsonShell(method, url, apiKey, jsonBody)
     local bodyPath   = '/tmp/lr-immich-curl-body.txt'
     local statusPath = '/tmp/lr-immich-curl-status.txt'
-
-    -- Clear last call's body so a missing -o write doesn't leak old data.
     local cf = io.open(bodyPath, 'w'); if cf then cf:close() end
 
     local args = {
@@ -411,40 +453,63 @@ local function curlJson(method, url, apiKey, jsonBody)
         args[#args + 1] = '-d'
         args[#args + 1] = shellEscape(jsonBody)
     end
-    args[#args + 1] = '-o'
-    args[#args + 1] = shellEscape(bodyPath)
-    args[#args + 1] = '-w'
-    args[#args + 1] = shellEscape('%{http_code}')
+    args[#args + 1] = '-o'; args[#args + 1] = shellEscape(bodyPath)
+    args[#args + 1] = '-w'; args[#args + 1] = shellEscape('%{http_code}')
     args[#args + 1] = shellEscape(url)
-    args[#args + 1] = '>'
-    args[#args + 1] = shellEscape(statusPath)
+    args[#args + 1] = '>'; args[#args + 1] = shellEscape(statusPath)
     args[#args + 1] = '2>&1'
 
-    local rc = LrTasks.execute(table.concat(args, ' '))
+    local rc = execResilient(table.concat(args, ' '), method .. ' (curl)')
 
     local statusCode = 0
-    do
-        local sf = io.open(statusPath, 'r')
-        if sf then
-            local raw = sf:read('*a') or ''
-            sf:close()
-            statusCode = tonumber(raw:match('(%d+)')) or 0
-        end
+    local sf = io.open(statusPath, 'r')
+    if sf then
+        local raw = sf:read('*a') or ''; sf:close()
+        statusCode = tonumber(raw:match('(%d+)')) or 0
     end
-
     local body = ''
-    do
-        local bf = io.open(bodyPath, 'r')
-        if bf then
-            body = bf:read('*a') or ''
-            bf:close()
-        end
-    end
+    local bf = io.open(bodyPath, 'r')
+    if bf then body = bf:read('*a') or ''; bf:close() end
 
     if rc ~= 0 and statusCode == 0 then
         return 0, string.format('curl exit %d', rc)
     end
     return statusCode, body
+end
+
+local function curlJson(method, url, apiKey, jsonBody)
+    -- DELETE-with-body stays on curl (see curlJsonShell). Everything else
+    -- runs in-process via LrHttp — no fork, no crash surface.
+    if method == 'DELETE' then
+        return curlJsonShell(method, url, apiKey, jsonBody)
+    end
+
+    local headers = {
+        { field = 'x-api-key', value = apiKey },
+        { field = 'Accept',    value = 'application/json' },
+    }
+
+    local body, respHeaders
+    if method == 'GET' then
+        body, respHeaders = LrHttp.get(url, headers, 30)
+    else
+        -- LrHttp.post's 4th arg IS a method override (unlike postMultipart's,
+        -- where it's a timeout — see replaceExisting). So PUT/POST/DELETE all
+        -- route through here with the body attached.
+        headers[#headers + 1] = { field = 'Content-Type', value = 'application/json' }
+        body, respHeaders = LrHttp.post(url, jsonBody or '', headers, method, 30)
+    end
+
+    -- LrHttp returns (responseBody, headersTable). headersTable.status holds
+    -- the numeric HTTP code on any response (incl. 4xx/5xx). On a transport
+    -- failure, responseBody is nil and headersTable is missing/has .error.
+    if not respHeaders or respHeaders.error or respHeaders.status == nil then
+        local e = respHeaders and respHeaders.error
+        local errText = (e and (e.name or tostring(e.errorCode)))
+            or 'LrHttp transport error'
+        return 0, errText
+    end
+    return (tonumber(respHeaders.status) or 0), body or ''
 end
 
 -- Replace the binary of an existing asset (UUID preserved). Returns (true, nil) or (false, err).
@@ -488,7 +553,11 @@ local function replaceExisting(publishSettings, jpegPath, remoteId, lrPhoto)
         '>', shellEscape(logPath), '2>&1',
     }, ' ')
 
-    local rc = LrTasks.execute(cmd)
+    -- curl multipart PUT must stay a shell-out (LrHttp.postMultipart can't
+    -- issue PUT — see note above). It's the last fork in the hot path, so
+    -- run it through the fork-crash retry wrapper. Replacing the same bytes
+    -- twice is idempotent, so a retry is always safe.
+    local rc = execResilient(cmd, 'replace ' .. remoteId)
     if rc == 0 then
         return true, nil
     end
@@ -600,15 +669,22 @@ local function fetchAllTags(url, apiKey)
     if status ~= 200 then
         return nil, string.format('GET /api/tags status=%d body=%s', status, body)
     end
-    local nameToId = {}
+    -- Key by the tag's "value" (its FULL hierarchical path), NOT "name"
+    -- (the leaf). Immich treats "/" in a tag as a hierarchy separator, so
+    -- LR keyword "Summilux 35mm f/1.4 FLE" becomes a tag with
+    -- value="Summilux 35mm f/1.4 FLE" but name="1.4 FLE" (child of
+    -- "Summilux 35mm f"). LR keywords always match the full value. Keying
+    -- by "name" made every "/"-containing keyword miss the cache → POST
+    -- /api/tags → 400 "already exists" → syncTags aborted. (v0.9.1)
+    local valueToId = {}
     for tagJson in body:gmatch('(%b{})') do
-        local tid = tagJson:match('"id"%s*:%s*"([^"]+)"')
-        local tname = tagJson:match('"name"%s*:%s*"([^"]+)"')
-        if tid and tname then
-            nameToId[tname] = tid
+        local tid    = tagJson:match('"id"%s*:%s*"([^"]+)"')
+        local tvalue = tagJson:match('"value"%s*:%s*"([^"]+)"')
+        if tid and tvalue then
+            valueToId[tvalue] = tid
         end
     end
-    return nameToId
+    return valueToId
 end
 
 -- Create a single tag in Immich. Returns tag id on success.
@@ -648,15 +724,20 @@ local function syncTags(url, apiKey, remoteId, lrKeywords, globalTagCache)
             remoteId, assetStatus, assetBody)
     end
 
+    -- Key the asset's current tags by "value" (full path) too, to match
+    -- the LR-keyword side and fetchAllTags. Assets only ever carry the
+    -- actual leaf/full tags they were assigned — never the structural
+    -- parent ("Summilux 35mm f") — so the remove-diff below won't wrongly
+    -- unlink a parent. (v0.9.1; verified against the asset_tag join.)
     local currentByName = {}
     local tagsBlock = assetBody:match('"tags"%s*:%s*(%b[])')
     if tagsBlock then
         local inner = tagsBlock:sub(2, -2)
         for tagJson in inner:gmatch('(%b{})') do
-            local tid = tagJson:match('"id"%s*:%s*"([^"]+)"')
-            local tname = tagJson:match('"name"%s*:%s*"([^"]+)"')
-            if tid and tname then
-                currentByName[tname] = tid
+            local tid    = tagJson:match('"id"%s*:%s*"([^"]+)"')
+            local tvalue = tagJson:match('"value"%s*:%s*"([^"]+)"')
+            if tid and tvalue then
+                currentByName[tvalue] = tid
             end
         end
     end
@@ -1110,7 +1191,7 @@ function provider.processRenderedPhotos(functionContext, exportContext)
                 shellEscape('.timeout 30000'),
                 shellEscape(catalogPath),
                 shellEscape(sql))
-            local rc = LrTasks.execute(cmd)
+            local rc = execResilient(cmd, 'flag-clear')
             log(string.format('  batched flag-clear: %d photos, rc=%d', #clearedPhotoIds, rc))
         else
             log('  skipped batched flag-clear — missing catalogPath or collId')

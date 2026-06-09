@@ -26,6 +26,7 @@ Limitations:
 
 local LrApplication     = import 'LrApplication'
 local LrTasks           = import 'LrTasks'
+local LrHttp            = import 'LrHttp'
 local LrDialogs         = import 'LrDialogs'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrProgressScope   = import 'LrProgressScope'
@@ -39,7 +40,7 @@ local LOG_PATH  = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.6.3] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.9.1] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -60,6 +61,31 @@ end
 local function shellEscape(s)
     if s == nil then return "''" end
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- Run an external command, surviving the macOS fork()-on-child-side crash
+-- (ObjC runtime isn't fork-safe; see publishServiceProvider.lua's note and
+-- the 2026-06-08 incident). Retries on failure since the race is
+-- intermittent and these commands (sqlite UPDATE, curl DELETE) are
+-- idempotent. Returns the final rc. v0.9.0.
+local function execResilient(cmd, label, tries)
+    tries = tries or 3
+    local rc = 0
+    for attempt = 1, tries do
+        rc = LrTasks.execute(cmd)
+        if rc == 0 then
+            if attempt > 1 then
+                log(string.format('  execResilient[%s]: succeeded on attempt %d/%d',
+                    tostring(label), attempt, tries))
+            end
+            return 0
+        end
+        log(string.format('  execResilient[%s]: attempt %d/%d rc=%d%s',
+            tostring(label), attempt, tries, rc,
+            attempt < tries and ' — retrying' or ' — giving up'))
+        if attempt < tries then LrTasks.sleep(0.2 * attempt) end
+    end
+    return rc
 end
 
 local function jsonString(s)
@@ -136,11 +162,19 @@ local function getSignature(photoId)
 end
 
 ----------------------------------------------------------------------------
--- curl wrapper. Returns (httpStatusCode, responseBody). NOT -f, so
--- HTTP-4xx bodies surface for diagnostics.
+-- JSON API helper (v0.9.0 — native LrHttp, no fork).
+--
+-- Was a curl shell-out — every LR fork() to run curl could crash on the
+-- child side (macOS ObjC runtime isn't fork-safe; the 2026-06-08 incident).
+-- GET/POST/PUT now run in-process via LrHttp. DELETE-with-body (tag unlink)
+-- stays on curl (curlJsonShell) because LrHttp's DELETE-body behavior is
+-- unverified and Immich's unlink endpoint requires the body — wrapped in
+-- execResilient so a fork-child crash retries. Same return contract:
+-- (httpStatusCode, responseBody); (0, errText) on transport failure.
+-- Mirrors publishServiceProvider.lua's curlJson.
 ----------------------------------------------------------------------------
 
-local function curlJson(method, url, apiKey, jsonBody)
+local function curlJsonShell(method, url, apiKey, jsonBody)
     local bodyPath   = '/tmp/lr-immich-curl-body.txt'
     local statusPath = '/tmp/lr-immich-curl-status.txt'
     local cf = io.open(bodyPath, 'w'); if cf then cf:close() end
@@ -163,7 +197,7 @@ local function curlJson(method, url, apiKey, jsonBody)
     args[#args + 1] = '>'; args[#args + 1] = shellEscape(statusPath)
     args[#args + 1] = '2>&1'
 
-    local rc = LrTasks.execute(table.concat(args, ' '))
+    local rc = execResilient(table.concat(args, ' '), method .. ' (curl)')
 
     local statusCode = 0
     local sf = io.open(statusPath, 'r')
@@ -182,6 +216,33 @@ local function curlJson(method, url, apiKey, jsonBody)
     return statusCode, body
 end
 
+local function curlJson(method, url, apiKey, jsonBody)
+    if method == 'DELETE' then
+        return curlJsonShell(method, url, apiKey, jsonBody)
+    end
+
+    local headers = {
+        { field = 'x-api-key', value = apiKey },
+        { field = 'Accept',    value = 'application/json' },
+    }
+
+    local body, respHeaders
+    if method == 'GET' then
+        body, respHeaders = LrHttp.get(url, headers, 30)
+    else
+        headers[#headers + 1] = { field = 'Content-Type', value = 'application/json' }
+        body, respHeaders = LrHttp.post(url, jsonBody or '', headers, method, 30)
+    end
+
+    if not respHeaders or respHeaders.error or respHeaders.status == nil then
+        local e = respHeaders and respHeaders.error
+        local errText = (e and (e.name or tostring(e.errorCode)))
+            or 'LrHttp transport error'
+        return 0, errText
+    end
+    return (tonumber(respHeaders.status) or 0), body or ''
+end
+
 ----------------------------------------------------------------------------
 -- Real Immich tag API
 ----------------------------------------------------------------------------
@@ -191,13 +252,17 @@ local function fetchAllTags(url, apiKey)
     if status ~= 200 then
         return nil, string.format('GET /api/tags status=%d body=%s', status, body)
     end
-    local nameToId = {}
+    -- Key by tag "value" (full hierarchical path), NOT "name" (leaf).
+    -- Immich treats "/" as a hierarchy separator, so "Summilux 35mm f/1.4
+    -- FLE" has value=full-path, name=leaf. LR keywords match the value.
+    -- (v0.9.1 — see publishServiceProvider.lua for the full writeup.)
+    local valueToId = {}
     for tagJson in body:gmatch('(%b{})') do
-        local tid = tagJson:match('"id"%s*:%s*"([^"]+)"')
-        local tname = tagJson:match('"name"%s*:%s*"([^"]+)"')
-        if tid and tname then nameToId[tname] = tid end
+        local tid    = tagJson:match('"id"%s*:%s*"([^"]+)"')
+        local tvalue = tagJson:match('"value"%s*:%s*"([^"]+)"')
+        if tid and tvalue then valueToId[tvalue] = tid end
     end
-    return nameToId
+    return valueToId
 end
 
 local function createTag(url, apiKey, name)
@@ -221,14 +286,17 @@ local function syncTags(url, apiKey, remoteId, lrKeywords, globalTagCache)
             remoteId, assetStatus, assetBody)
     end
 
+    -- Key current asset tags by "value" (full path) to match LR keywords
+    -- and fetchAllTags. Assets carry only leaf/full tags, never structural
+    -- parents, so the remove-diff stays correct. (v0.9.1)
     local currentByName = {}
     local tagsBlock = assetBody:match('"tags"%s*:%s*(%b[])')
     if tagsBlock then
         local inner = tagsBlock:sub(2, -2)
         for tagJson in inner:gmatch('(%b{})') do
-            local tid = tagJson:match('"id"%s*:%s*"([^"]+)"')
-            local tname = tagJson:match('"name"%s*:%s*"([^"]+)"')
-            if tid and tname then currentByName[tname] = tid end
+            local tid    = tagJson:match('"id"%s*:%s*"([^"]+)"')
+            local tvalue = tagJson:match('"value"%s*:%s*"([^"]+)"')
+            if tid and tvalue then currentByName[tvalue] = tid end
         end
     end
 
@@ -449,7 +517,7 @@ local function pushSelected()
                     shellEscape('.timeout 30000'),
                     shellEscape(catalogPath),
                     shellEscape(table.concat(sqlParts)))
-                local rc = LrTasks.execute(cmd)
+                local rc = execResilient(cmd, 'flag-clear')
                 local nc = 0; for _ in pairs(byColl) do nc = nc + 1 end
                 log(string.format('  batched flag-clear: %d photos across %d collection(s), rc=%d',
                     #clearedEntries, nc, rc))

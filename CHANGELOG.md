@@ -1,5 +1,71 @@
 # lr-immich changelog
 
+## 0.9.1 — 2026-06-08
+
+Tag-sync fix for keywords containing "/". Keywords like
+`Summilux 35mm f/1.4 FLE` were failing tag sync on every publish with
+`POST /api/tags … 400 "A tag with that name already exists"`, which
+aborted `syncTags` for the whole photo.
+
+Cause: Immich treats `/` as a tag **hierarchy separator**. That keyword
+becomes a tag whose `value` is the full path `Summilux 35mm f/1.4 FLE`
+(child of an auto-created `Summilux 35mm f`), but whose `name` is just the
+leaf `1.4 FLE`. `fetchAllTags` and `syncTags` keyed their caches by the
+JSON **`name`** field, so any "/"-containing keyword never matched an
+existing tag → the plugin tried to *create* it → 400.
+
+Fix: key the tag cache and the asset's current-tags by **`value`** (the
+full path) instead of `name`. LR keywords always equal the full value, so
+they now match existing tags — no spurious create, no 400, syncTags runs
+to completion. Verified against the Immich DB that assets carry only their
+leaf/full tags (never the structural parent), so the add/remove diff stays
+correct and won't unlink a parent. Applied to both publishServiceProvider.lua
+and pushSelected.lua.
+
+## 0.9.0 — 2026-06-08
+
+Fork-crash hardening. Stops the intermittent macOS crash where a publish
+run dies mid-batch with `EXC_BAD_ACCESS` / "crashed on child side of fork
+pre-exec."
+
+Background:
+The 2026-06-08 incident produced 7 crash reports in a single publish,
+all fork-children segfaulting before exec — stack ending in
+`fork → libSystem_atfork_child → objc_class::realizeIfNeeded`. Cause is
+the well-known macOS landmine: `fork()` is not safe in a multithreaded
+process with the Objective-C runtime loaded (Lightroom has CEF + ObjC
+live). Every `LrTasks.execute` shell-out is such a fork, and the plugin
+shelled out to `curl` for *every* JSON API call — so a large batch meant
+many forks and good odds one hit the race. (That run still completed: all
+33 photos uploaded once, no duplicates — the crashes were non-fatal fork
+children, but they flooded logs and could drop individual calls.)
+
+Two fixes:
+
+1. `curlJson` now uses native `LrHttp` instead of shelling out to `curl`.
+   Tag list/create, tag link/unlink, asset GET, metadata PATCH, and the
+   Darkroom title push all run in-process now — no fork, no crash surface.
+   This removes the large majority of forks per publish. Same return
+   contract: `(httpStatusCode, responseBody)`; `(0, errText)` on transport
+   failure; 4xx/5xx still return status + body for diagnostics.
+
+2. New `execResilient()` wrapper retries `LrTasks.execute` on failure
+   (default 3 tries, 0.2s·attempt backoff, logged). Applied to the three
+   remaining genuine forks — the `curl` multipart PUT in `replaceExisting`
+   (LrHttp can't issue PUT, see its note), `mkdir -p` for the sig sidecar,
+   and the sqlite3 `photoNeedsUpdating` flag-clear. All idempotent, so a
+   retry after a fork-child crash is always safe and usually succeeds
+   (the race is intermittent).
+
+Net: a publish now forks ~once per replaced photo instead of ~5–10×, and
+any fork that does crash is retried instead of failing the photo.
+
+`pushSelected.lua` (the Library → Plug-in Extras "Push Selected to Immich"
+action) gets the same treatment: `LrHttp` for GET/POST/PUT, curl-only for
+DELETE-with-body, and `execResilient` on the DELETE and the sqlite3
+flag-clear. It does metadata-only PATCHes (no multipart upload), so after
+this it forks at most on a keyword removal or the final flag-clear.
+
 ## 0.8.0 — 2026-05-26
 
 Service-wide remoteId lookup. Fixes already-synced photos appearing as
