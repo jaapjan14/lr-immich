@@ -1,5 +1,36 @@
 # lr-immich changelog
 
+## 0.9.2 — 2026-06-10
+
+Per-tag resilience in `syncTags`. A single unresolvable keyword no longer
+aborts the whole asset's tag sync.
+
+Observed 2026-06-10: photo `2025-08-24_027_leicamp-Edit` was given 24
+keywords; only the title synced and **all 24 tags were dropped** from the
+Immich asset. Cause: when a brand-new keyword (`shallows`) is added, the
+REPLACE path uploads the JPEG, Immich's IPTC parser **asynchronously**
+auto-creates a `shallows` tag, then `syncTags` tries to create it too and
+gets `400 "already exists"`. The v0.6.4 single-refresh recovery lost the
+race (likely a Cloudflare-cached `/api/tags` after the v0.9.0 curl→LrHttp
+switch), so the lookup stayed nil and the code hit `return false` — which
+aborted **every** remaining tag for that photo, not just `shallows`.
+
+Fix:
+- **Continue-on-failure**: an unresolvable/failed tag is collected and
+  skipped; the rest of the photo's tags still sync. Removals are likewise
+  per-tag non-fatal. Returns a `linked N/M, could not resolve: …` summary.
+- **Async-import retry**: on a `400 "already exists"`, refresh the cache
+  and retry the lookup up to 3× (1s apart) to let Immich's importer catch
+  up. One refresh picks up every importer-created tag at once, so later
+  tags in the same photo hit cache without re-fetching. Refreshes are
+  capped (4/run) to avoid a GET storm.
+- **Case-insensitive lookup**: Immich tag uniqueness is case-insensitive,
+  so LR keyword `shallows` now also matches an Immich tag stored as
+  `Shallows`.
+
+The publish itself was already non-fatal on tag-sync failure; this stops
+the silent data loss where good tags vanished alongside one bad one.
+
 ## 0.9.1 — 2026-06-08
 
 Tag-sync fix for keywords containing "/". Keywords like

@@ -25,7 +25,7 @@ local LOG_PATH = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.9.1] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.9.2] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -766,62 +766,104 @@ local function syncTags(url, apiKey, remoteId, lrKeywords, globalTagCache)
         return true, 'no tag changes', 0, 0
     end
 
-    -- 4. Adds: ensure tag exists (via cache + POST if missing), then link.
+    -- 4. Adds: ensure each tag exists, then link it to the asset.
     --
-    -- v0.6.4: 400 "A tag with that name already exists" recovery.
-    -- Immich's IPTC parser asynchronously creates tags during multipart
-    -- uploads — so by the time syncTags runs after UPLOAD-NEW, our
-    -- globalTagCache (fetched at publish start) is stale and POST
-    -- /api/tags returns 400 for any keyword Immich just auto-imported.
-    -- v0.6.3 aborted the whole sync on first 400; v0.6.4 detects the
-    -- specific "already exists" error, refreshes the cache once, and
-    -- continues.
-    local cacheRefreshed = false
-    for _, name in ipairs(toAddNames) do
-        local tagId = globalTagCache[name]
-        if not tagId then
-            local newId, err = createTag(url, apiKey, name)
-            if not newId then
-                local isDup = tostring(err):find('already exists', 1, true) ~= nil
-                if isDup and not cacheRefreshed then
-                    -- Refresh cache from Immich — auto-imported tags will
-                    -- now show up. Do this at most once per sync run.
-                    local fresh = fetchAllTags(url, apiKey)
-                    if fresh then
-                        for k, v in pairs(fresh) do globalTagCache[k] = v end
-                        cacheRefreshed = true
-                        tagId = globalTagCache[name]
-                    end
-                end
-                if not tagId then
-                    return false, 'tag create failed: ' .. tostring(err)
-                end
-            else
-                globalTagCache[name] = newId
-                tagId = newId
-            end
+    -- v0.9.2: PER-TAG RESILIENCE. Previously a single unresolvable tag did
+    -- `return false`, which aborted the WHOLE asset's tag sync and silently
+    -- dropped every other keyword. Observed 2026-06-10: photo 027 lost all
+    -- 24 tags because "shallows" raced Immich's async IPTC importer. Now we
+    -- skip only the offending tag and keep syncing the rest; failures are
+    -- collected and surfaced, never fatal.
+    --
+    -- The race: Immich's IPTC parser asynchronously creates tags from the
+    -- JPEG we just uploaded, so a brand-new keyword may not be in our
+    -- start-of-run cache AND POST /api/tags returns 400 "already exists".
+    -- We refresh the cache and retry a few times to let the importer catch
+    -- up. Lookups are case-insensitive because Immich tag uniqueness is
+    -- case-insensitive — LR keyword "shallows" must still match an Immich
+    -- tag stored as "Shallows".
+    local failures = {}
+
+    -- Case-insensitive cache lookup: exact hit first (fast), then a
+    -- lowercased scan over the cached value→id map.
+    local function lookupTag(name)
+        local id = globalTagCache[name]
+        if id then return id end
+        local lname = name:lower()
+        for value, vid in pairs(globalTagCache) do
+            if value:lower() == lname then return vid end
         end
-        -- PUT /api/tags/{id}/assets — link the asset (idempotent on Immich).
-        local linkBody = '{"ids":["' .. remoteId .. '"]}'
-        local lStatus, lBody = curlJson(
-            'PUT', url .. '/api/tags/' .. tagId .. '/assets', apiKey, linkBody)
-        if lStatus ~= 200 and lStatus ~= 204 then
-            return false, string.format(
-                'tag link tag=%s status=%d body=%s', tagId, lStatus, lBody)
+        return nil
+    end
+
+    -- Refresh the whole tag cache from Immich, capped per sync run so a
+    -- batch of truly-unresolvable tags can't trigger a GET storm. One
+    -- refresh picks up ALL tags the importer just auto-created, so later
+    -- tags in the same photo usually hit cache without re-fetching.
+    local refreshes = 0
+    local function refreshCache()
+        if refreshes >= 4 then return end
+        refreshes = refreshes + 1
+        local fresh = fetchAllTags(url, apiKey)
+        if fresh then
+            for k, v in pairs(fresh) do globalTagCache[k] = v end
         end
     end
 
-    -- 5. Removes.
+    for _, name in ipairs(toAddNames) do
+        local tagId = lookupTag(name)
+        if not tagId then
+            local newId, err = createTag(url, apiKey, name)
+            if newId then
+                globalTagCache[name] = newId
+                tagId = newId
+            elseif tostring(err):find('already exists', 1, true) then
+                -- Tag exists (Immich auto-created it from IPTC) but isn't in
+                -- our cache yet. Refresh + retry, giving the importer a beat.
+                for attempt = 1, 3 do
+                    refreshCache()
+                    tagId = lookupTag(name)
+                    if tagId then break end
+                    LrTasks.sleep(1.0)
+                end
+                if not tagId then
+                    failures[#failures + 1] = name
+                    log(string.format('    tag sync: could not resolve %q after retries — skipping, continuing with the rest', name))
+                end
+            else
+                failures[#failures + 1] = name
+                log(string.format('    tag sync: create failed for %q (skipped): %s', name, tostring(err)))
+            end
+        end
+        if tagId then
+            -- PUT /api/tags/{id}/assets — link the asset (idempotent on Immich).
+            local linkBody = '{"ids":["' .. remoteId .. '"]}'
+            local lStatus, lBody = curlJson(
+                'PUT', url .. '/api/tags/' .. tagId .. '/assets', apiKey, linkBody)
+            if lStatus ~= 200 and lStatus ~= 204 then
+                failures[#failures + 1] = name
+                log(string.format('    tag sync: link failed for %q (skipped): status=%d body=%s',
+                    name, lStatus, tostring(lBody)))
+            end
+        end
+    end
+
+    -- 5. Removes (also per-tag non-fatal — a stuck removal must not block adds).
     for _, tid in ipairs(toRemoveIds) do
         local rmBody = '{"ids":["' .. remoteId .. '"]}'
         local dStatus, dBody = curlJson(
             'DELETE', url .. '/api/tags/' .. tid .. '/assets', apiKey, rmBody)
         if dStatus ~= 200 and dStatus ~= 204 then
-            return false, string.format(
-                'tag unlink tag=%s status=%d body=%s', tid, dStatus, dBody)
+            log(string.format('    tag sync: unlink failed for tag=%s (skipped): status=%d body=%s',
+                tid, dStatus, tostring(dBody)))
         end
     end
 
+    if #failures > 0 then
+        return false, string.format('linked %d/%d, could not resolve: %s',
+            #toAddNames - #failures, #toAddNames, table.concat(failures, ', ')),
+            #toAddNames - #failures, #toRemoveIds
+    end
     return true, 'tag sync ok', #toAddNames, #toRemoveIds
 end
 

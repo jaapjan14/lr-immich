@@ -40,7 +40,7 @@ local LOG_PATH  = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.9.1] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.9.2] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -315,20 +315,64 @@ local function syncTags(url, apiKey, remoteId, lrKeywords, globalTagCache)
         return true, 'no tag changes', 0, 0
     end
 
+    -- v0.9.2: per-tag resilience — one unresolvable tag must not drop the
+    -- rest. Mirrors publishServiceProvider.lua's syncTags. Case-insensitive
+    -- lookup (Immich tag uniqueness is case-insensitive) + refresh/retry on
+    -- a 400 "already exists" + continue-on-failure.
+    local failures = {}
+
+    local function lookupTag(name)
+        local id = globalTagCache[name]
+        if id then return id end
+        local lname = name:lower()
+        for value, vid in pairs(globalTagCache) do
+            if value:lower() == lname then return vid end
+        end
+        return nil
+    end
+
+    local refreshes = 0
+    local function refreshCache()
+        if refreshes >= 4 then return end
+        refreshes = refreshes + 1
+        local fresh = fetchAllTags(url, apiKey)
+        if fresh then
+            for k, v in pairs(fresh) do globalTagCache[k] = v end
+        end
+    end
+
     for _, name in ipairs(toAddNames) do
-        local tagId = globalTagCache[name]
+        local tagId = lookupTag(name)
         if not tagId then
             local newId, err = createTag(url, apiKey, name)
-            if not newId then return false, 'tag create: ' .. tostring(err) end
-            globalTagCache[name] = newId
-            tagId = newId
+            if newId then
+                globalTagCache[name] = newId
+                tagId = newId
+            elseif tostring(err):find('already exists', 1, true) then
+                for attempt = 1, 3 do
+                    refreshCache()
+                    tagId = lookupTag(name)
+                    if tagId then break end
+                    LrTasks.sleep(1.0)
+                end
+                if not tagId then
+                    failures[#failures + 1] = name
+                    log(string.format('    tag sync: could not resolve %q after retries — skipping', name))
+                end
+            else
+                failures[#failures + 1] = name
+                log(string.format('    tag sync: create failed for %q (skipped): %s', name, tostring(err)))
+            end
         end
-        local linkBody = '{"ids":["' .. remoteId .. '"]}'
-        local lStatus, lBody =
-            curlJson('PUT', url .. '/api/tags/' .. tagId .. '/assets', apiKey, linkBody)
-        if lStatus ~= 200 and lStatus ~= 204 then
-            return false, string.format(
-                'tag link tag=%s status=%d body=%s', tagId, lStatus, lBody)
+        if tagId then
+            local linkBody = '{"ids":["' .. remoteId .. '"]}'
+            local lStatus, lBody =
+                curlJson('PUT', url .. '/api/tags/' .. tagId .. '/assets', apiKey, linkBody)
+            if lStatus ~= 200 and lStatus ~= 204 then
+                failures[#failures + 1] = name
+                log(string.format('    tag sync: link failed for %q (skipped): status=%d body=%s',
+                    name, lStatus, tostring(lBody)))
+            end
         end
     end
 
@@ -337,11 +381,16 @@ local function syncTags(url, apiKey, remoteId, lrKeywords, globalTagCache)
         local dStatus, dBody =
             curlJson('DELETE', url .. '/api/tags/' .. tid .. '/assets', apiKey, rmBody)
         if dStatus ~= 200 and dStatus ~= 204 then
-            return false, string.format(
-                'tag unlink tag=%s status=%d body=%s', tid, dStatus, dBody)
+            log(string.format('    tag sync: unlink failed for tag=%s (skipped): status=%d body=%s',
+                tid, dStatus, tostring(dBody)))
         end
     end
 
+    if #failures > 0 then
+        return false, string.format('linked %d/%d, could not resolve: %s',
+            #toAddNames - #failures, #toAddNames, table.concat(failures, ', ')),
+            #toAddNames - #failures, #toRemoveIds
+    end
     return true, 'tag sync ok', #toAddNames, #toRemoveIds
 end
 
