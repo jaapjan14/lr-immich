@@ -1,26 +1,32 @@
 --[[----------------------------------------------------------------------------
 pushSelected.lua — Library → Plug-in Extras menu item
 
-Push metadata-only changes for the currently-selected photos to Immich
-immediately, bypassing the publish-service queue. Useful when you've
-made caption / GPS / keyword / dateCreated edits on a handful of
-already-published photos and want them on Immich without batch-
-publishing whatever else is in the Modified queue.
+Re-publish the currently-selected (already-published) photos to Immich
+immediately, bypassing the publish-service queue. Useful when you've made
+caption / GPS / keyword / dateCreated / develop edits on a handful of
+already-published photos and want them on Immich without batch-publishing
+whatever else is in the Modified queue.
+
+v0.10.0 UPLOAD-ONLY: this re-renders each selected photo and re-uploads
+the JPEG bytes via REPLACE (PUT /api/assets/{id}/original, preserving the
+UUID). Immich extracts the embedded metadata (date/caption/GPS/keywords)
+on upload with ZERO sidecar writes. The OLD path did a metadata-only
+PUT /api/assets/{id} + /api/tags sync, which each queued a SidecarWrite
+that wrote a bad .xmp — Immich read that sidecar in preference to the
+embedded JPEG, corrupting dates to midnight and dropping tags. Never again.
 
 Known UI quirk (NOT a bug — it's how LR's Publish Services view works):
   The photo will stay visually in "Modified Photos to Re-Publish" after
   this menu runs. LR caches its publish-service view state and doesn't
   refresh until restart, plugin reload, or collection-switch + back.
-  The data IS correct (Immich is patched, AgRemotePhoto.photoNeedsUpdating
-  is 0, signatures stored) — just LR's UI displays stale state. Same
-  applies to regular Publish runs, just less visible because the publish
-  progress dialog gives a "something happened" signal.
+  The data IS correct (AgRemotePhoto.photoNeedsUpdating is 0) — just LR's
+  UI displays stale state.
 
 Limitations:
-  1. METADATA-ONLY. If a photo's develop settings have changed since
-     last publish (signature mismatch), it gets SKIPPED. Use regular
-     Publish for that — develop changes require re-rendering bytes.
-  2. Photo must already be published to Immich (need a UUID to PATCH).
+  1. Photo must already be published to Immich (need a UUID to REPLACE).
+     Unpublished selections are skipped — use regular Publish for those.
+  2. Re-renders bytes every time (no fast metadata-only path anymore) —
+     that's the cost of never corrupting dates again.
   3. Multiple lr-immich publish services configured: uses the FIRST.
 ------------------------------------------------------------------------------]]
 
@@ -33,6 +39,8 @@ local LrProgressScope   = import 'LrProgressScope'
 local LrPathUtils       = import 'LrPathUtils'
 local LrDate            = import 'LrDate'
 local LrPasswords       = import 'LrPasswords'
+local LrFileUtils       = import 'LrFileUtils'        -- v0.10.0: buildMultipart fileAttributes
+local LrExportSession   = import 'LrExportSession'    -- v0.10.0: re-render selected for full re-upload
 
 local PLUGIN_ID = 'com.lakatua.lr-immich'
 local LOG_PATH  = '/tmp/lr-immich.log'
@@ -40,7 +48,7 @@ local LOG_PATH  = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.9.2] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.10.0] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -417,6 +425,89 @@ end
 -- Main
 ----------------------------------------------------------------------------
 
+-- v0.10.0 UPLOAD-ONLY upload helpers (ported from publishServiceProvider.lua,
+-- adapted to explicit url/apiKey args). "Push Selected" now re-renders the
+-- selected photos and re-uploads the bytes so Immich extracts the embedded
+-- metadata (date/caption/GPS/keywords) — instead of the old metadata-only
+-- PATCH + /api/tags sync, which each queued a SidecarWrite that wrote a bad
+-- .xmp, corrupted dates to midnight, and dropped tags.
+local function buildMultipart(jpegPath, deviceId, libraryId, lrPhoto)
+    local stat = LrFileUtils.fileAttributes(jpegPath)
+    local mtimeIso = LrDate.timeToIsoDate(stat and stat.fileModificationDate or LrDate.currentTime())
+    local createdAt = mtimeIso
+    if lrPhoto then
+        local captureTime = lrPhoto:getRawMetadata('dateTimeOriginal')
+        if captureTime then createdAt = LrDate.timeToIsoDate(captureTime) end
+    end
+    local filename = LrPathUtils.leafName(jpegPath)
+    local fields = {
+        { name = 'deviceAssetId',  value = filename },
+        { name = 'deviceId',       value = deviceId or 'lr-immich' },
+        { name = 'fileCreatedAt',  value = createdAt },
+        { name = 'fileModifiedAt', value = mtimeIso },
+        { name = 'isFavorite',     value = 'false' },
+        { name = 'assetData',
+          fileName    = filename,
+          filePath    = jpegPath,
+          contentType = 'image/jpeg' },
+    }
+    if libraryId and libraryId ~= '' then
+        table.insert(fields, { name = 'libraryId', value = libraryId })
+    end
+    return fields
+end
+
+-- POST a new asset. Returns (uuid, errMsg).
+local function uploadNewAsset(url, apiKey, deviceId, libraryId, jpegPath, lrPhoto)
+    local headers = {
+        { field = 'x-api-key', value = apiKey },
+        { field = 'Accept',    value = 'application/json' },
+    }
+    local fields = buildMultipart(jpegPath, deviceId, libraryId, lrPhoto)
+    local body, respHeaders = LrHttp.postMultipart(url .. '/api/assets', fields, headers)
+    local status = respHeaders and respHeaders.status
+    if status == 200 or status == 201 then
+        local uuid = body and body:match('"id"%s*:%s*"([^"]+)"')
+        if uuid then return uuid, nil end
+        return nil, 'Upload HTTP ' .. tostring(status) .. ' but no asset id:\n' .. tostring(body)
+    end
+    return nil, 'Upload FAILED — HTTP ' .. tostring(status or '?') .. '\n' .. tostring(body or '')
+end
+
+-- PUT replace existing asset bytes (preserves UUID). Returns (true) or (false, err).
+-- /api/assets/<id>/original REQUIRES multipart PUT — shell out to curl (LrHttp can't PUT multipart).
+local function replaceAsset(url, apiKey, deviceId, jpegPath, remoteId, lrPhoto)
+    local filename = LrPathUtils.leafName(jpegPath)
+    local stat = LrFileUtils.fileAttributes(jpegPath)
+    local mtimeIso = LrDate.timeToIsoDate(stat and stat.fileModificationDate or LrDate.currentTime())
+    local createdAt = mtimeIso
+    if lrPhoto then
+        local captureTime = lrPhoto:getRawMetadata('dateTimeOriginal')
+        if captureTime then createdAt = LrDate.timeToIsoDate(captureTime) end
+    end
+    deviceId = deviceId or 'lr-immich'
+    local logPath = LrPathUtils.standardizePath('/tmp/lr-immich-curl.log')
+    local cmd = table.concat({
+        'curl', '-sS', '-f', '--max-time', '120',
+        '-X', 'PUT',
+        '-H', shellEscape('x-api-key: ' .. apiKey),
+        '-F', shellEscape('assetData=@' .. jpegPath),
+        '-F', shellEscape('deviceAssetId=lr-replace-' .. filename),
+        '-F', shellEscape('deviceId='      .. deviceId),
+        '-F', shellEscape('fileCreatedAt=' .. createdAt),
+        '-F', shellEscape('fileModifiedAt='.. mtimeIso),
+        shellEscape(url .. '/api/assets/' .. remoteId .. '/original'),
+        '>', shellEscape(logPath), '2>&1',
+    }, ' ')
+    local rc = execResilient(cmd, 'replace ' .. remoteId)
+    if rc == 0 then return true, nil end
+    local detail = ''
+    local f = io.open(logPath, 'r')
+    if f then detail = f:read('*a') or ''; f:close() end
+    return false, string.format('PUT /api/assets/%s/original failed (curl exit %d).\n%s',
+        remoteId, rc, detail)
+end
+
 local function pushSelected()
     LrFunctionContext.callWithContext('pushSelected', function(context)
         local catalog = LrApplication.activeCatalog()
@@ -466,81 +557,83 @@ local function pushSelected()
         end
         log(string.format('  built lookup of %d published photos across service collections', lookupCount))
 
-        -- Cache Immich tags once for this run.
-        local globalTagCache = nil
-        do
-            local tags, err = fetchAllTags(url, apiKey)
-            if tags then
-                local n = 0; for _ in pairs(tags) do n = n + 1 end
-                log(string.format('  tag cache: %d existing Immich tags', n))
-                globalTagCache = tags
+        -- v0.10.0 UPLOAD-ONLY: only photos already published to Immich (have a
+        -- remoteId) get re-rendered + re-uploaded here. Unpublished ones are
+        -- skipped — use regular Publish to send them new.
+        local stats = {
+            replaced             = 0,
+            skipped_unpublished  = 0,
+            failed               = 0,
+        }
+        local clearedEntries = {}
+
+        local toRender = {}
+        for _, photo in ipairs(selected) do
+            if entryByPhotoId[photo.localIdentifier] then
+                toRender[#toRender + 1] = photo
             else
-                log('  tag cache: GET /api/tags FAILED — tag sync skipped. err=' .. tostring(err))
+                local fileName = photo:getFormattedMetadata('fileName') or '?'
+                log(string.format('  %s: SKIP — not yet published to Immich', fileName))
+                stats.skipped_unpublished = stats.skipped_unpublished + 1
             end
         end
 
+        if #toRender == 0 then
+            LrDialogs.message('Push to Immich',
+                'None of the selected photos are published to Immich yet.\nUse regular Publish to send them.', 'info')
+            return
+        end
+
+        local deviceId  = props.immichDeviceId
+        local libraryId = props.immichLibraryId
+
         local progress = LrProgressScope {
-            title = string.format('Pushing %d photo%s to Immich',
-                #selected, #selected == 1 and '' or 's'),
+            title = string.format('Re-publishing %d photo%s to Immich',
+                #toRender, #toRender == 1 and '' or 's'),
             functionContext = context,
         }
 
-        local stats = {
-            patched              = 0,
-            skipped_unpublished  = 0,
-            skipped_full_needed  = 0,
-            failed               = 0,
+        -- Re-render the selected photos through the SAME export settings as the
+        -- publish service, then re-upload the bytes via REPLACE (preserves the
+        -- Immich UUID). Immich extracts the embedded metadata (date/caption/GPS/
+        -- keywords) on upload with ZERO sidecar writes. This is what makes
+        -- "Push Selected" honor develop changes too (the old path skipped them).
+        local exportSession = LrExportSession {
+            photosToExport = toRender,
+            exportSettings = props,
         }
 
-        local clearedEntries = {}
-
-        for i, photo in ipairs(selected) do
+        local idx = 0
+        for _, rendition in exportSession:renditions() do
             if progress:isCanceled() then break end
-            progress:setPortionComplete(i - 1, #selected)
+            idx = idx + 1
+            progress:setPortionComplete(idx - 1, #toRender)
 
-            local pid      = photo.localIdentifier
-            local fileName = photo:getFormattedMetadata('fileName') or '?'
-            local entry    = entryByPhotoId[pid]
+            local success, pathOrMsg = rendition:waitForRender()
+            local photo    = rendition.photo
+            local pid      = photo and photo.localIdentifier
+            local entry    = pid and entryByPhotoId[pid]
+            local fileName = photo and photo:getFormattedMetadata('fileName') or '?'
 
-            if not entry then
-                log(string.format('  %s: SKIP — not in any lr-immich publish collection', fileName))
-                stats.skipped_unpublished = stats.skipped_unpublished + 1
-            else
-                local currentSig = computeSignature(photo)
-                local storedSig  = getSignature(pid)
-                if storedSig and storedSig == currentSig then
-                    log(string.format('  %s: METADATA-ONLY → PUT /api/assets/%s', fileName, entry.remoteId))
-                    local ok, err = patchMetadata(url, apiKey, entry.remoteId, photo)
-                    if ok then
-                        log('    ✓ patched')
-                        if globalTagCache then
-                            local kws = getKeywordList(photo)
-                            local tagOk, tagMsg, addedN, removedN =
-                                syncTags(url, apiKey, entry.remoteId, kws, globalTagCache)
-                            if tagOk then
-                                log(string.format('    tag sync: %s, added=%d removed=%d (lr_kw_count=%d)',
-                                    tostring(tagMsg), addedN or 0, removedN or 0, #kws))
-                            else
-                                log('    tag sync FAILED: ' .. tostring(tagMsg))
-                            end
-                        end
-                        stats.patched = stats.patched + 1
-                        clearedEntries[#clearedEntries + 1] = {
-                            photoId = pid, collectionId = entry.collectionId,
-                        }
-                    else
-                        log('    ✗ failed: ' .. tostring(err))
-                        stats.failed = stats.failed + 1
-                    end
+            if not success then
+                log(string.format('  %s: render FAILED: %s', fileName, tostring(pathOrMsg)))
+                stats.failed = stats.failed + 1
+            elseif entry then
+                log(string.format('  %s: REPLACE → PUT /api/assets/%s/original', fileName, entry.remoteId))
+                local ok, err = replaceAsset(url, apiKey, deviceId, pathOrMsg, entry.remoteId, photo)
+                if ok then
+                    log('    ✓ re-uploaded (Immich will re-extract embedded metadata)')
+                    stats.replaced = stats.replaced + 1
+                    clearedEntries[#clearedEntries + 1] = {
+                        photoId = pid, collectionId = entry.collectionId,
+                    }
                 else
-                    log(string.format(
-                        '  %s: SKIP — signature mismatch (develop changed; use regular Publish)',
-                        fileName))
-                    stats.skipped_full_needed = stats.skipped_full_needed + 1
+                    log('    ✗ replace failed: ' .. tostring(err))
+                    stats.failed = stats.failed + 1
                 end
             end
 
-            progress:setPortionComplete(i, #selected)
+            progress:setPortionComplete(idx, #toRender)
         end
 
         -- Batched flag-clear (one sqlite3 invocation, grouped by collection).
@@ -576,14 +669,14 @@ local function pushSelected()
         progress:done()
 
         log(string.format(
-            '  ---- pushSelected DONE: %d patched, %d unpublished, %d needs-full, %d failed ----',
-            stats.patched, stats.skipped_unpublished, stats.skipped_full_needed, stats.failed))
+            '  ---- pushSelected DONE: %d re-uploaded, %d unpublished(skipped), %d failed ----',
+            stats.replaced, stats.skipped_unpublished, stats.failed))
 
         LrDialogs.message(
             'Push to Immich complete',
             string.format(
-                '%d patched.\n%d skipped (not yet published).\n%d skipped (needs full Publish — develop changed).\n%d failed.\n\nNote: photo(s) may still appear in "Modified Photos to Re-Publish" until you restart LR or switch collections — that\'s LR UI caching, not a real status.',
-                stats.patched, stats.skipped_unpublished, stats.skipped_full_needed, stats.failed),
+                '%d re-uploaded (Immich re-extracts embedded date/caption/keywords).\n%d skipped (not yet published — use regular Publish).\n%d failed.\n\nNote: photo(s) may still appear in "Modified Photos to Re-Publish" until you restart LR or switch collections — that\'s LR UI caching, not a real status.',
+                stats.replaced, stats.skipped_unpublished, stats.failed),
             'info')
     end)
 end

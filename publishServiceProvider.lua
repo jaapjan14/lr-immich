@@ -25,7 +25,7 @@ local LOG_PATH = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.9.2] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.10.0] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -992,6 +992,18 @@ function provider.processRenderedPhotos(functionContext, exportContext)
         end
     end
 
+    -- v0.9.3: Detect when a stored remoteId points at an asset that no longer
+    -- exists in Immich (deleted server-side / bulk cleanup). Lets a republish
+    -- self-heal into a fresh UPLOAD-NEW instead of failing forever on a dead id
+    -- (PATCH → 400 "Not found", REPLACE → curl error). Authoritative GET, only
+    -- called on the (rare) failure path so normal publishes pay nothing. Also
+    -- the behavior Immich v3 forces — it removes PUT /assets/{id}/original.
+    local function remoteGone(remoteId)
+        if not remoteId or remoteId == '' then return true end
+        local s = curlJson('GET', baseUrl .. '/api/assets/' .. remoteId, apiKey, nil)
+        return s == 404 or s == 400
+    end
+
     local progressScope = exportContext:configureProgress {
         title = nPhotos > 1
             and ('Publishing ' .. nPhotos .. ' photos to Immich')
@@ -1140,58 +1152,19 @@ function provider.processRenderedPhotos(functionContext, exportContext)
                     #currentSig, tostring(sigMatch)))
             end
 
-            if remoteId and remoteId ~= '' and storedSig and storedSig == currentSig then
-                -- METADATA-ONLY PATH. JPEG was rendered but we throw it
-                -- away — render is cheap (~1-2s), upload is the slow part
-                -- (~10-30s) and that's what we skip. No shadow created on
-                -- Immich either (PUT /api/assets/{id} doesn't trash the
-                -- existing file, unlike /api/assets/{id}/original).
-                log('    → METADATA-ONLY path (PUT /api/assets/' .. remoteId .. ')')
-                local ok, err = patchMetadata(publishSettings, remoteId, photo)
-                if ok then
-                    log('    ✓ metadata patch succeeded')
-                    doSyncTags(photo, remoteId, 'metadata-only')
-                    pushTitleToDarkroom(publishSettings, remoteId, photo)
-                    rendition:recordPublishedPhotoId(remoteId)
-                    rendition:recordPublishedPhotoUrl(baseUrl .. '/photos/' .. remoteId)
-                    if photoId then
-                        clearedPhotoIds[#clearedPhotoIds + 1] = photoId
-                    end
-                    -- Don't re-save signature: it's unchanged by definition.
-                    cnMeta = cnMeta + 1
-                else
-                    log('    ✗ metadata patch failed: ' .. tostring(err))
-                    rendition:uploadFailed(err)
-                    cnFail = cnFail + 1
-                end
-            elseif remoteId and remoteId ~= '' then
-                -- REPLACE PATH — develop or keywords changed, or first
-                -- post-v0.5.0 publish for a photo that has no signature yet.
-                log('    → REPLACE path (curl PUT to /api/assets/' .. remoteId .. '/original)')
-                local ok, err = replaceExisting(publishSettings, jpegPath, remoteId, photo)
-                if ok then
-                    log('    ✓ replace succeeded, recording remoteId+url')
-                    doSyncTags(photo, remoteId, 'replace')
-                    pushTitleToDarkroom(publishSettings, remoteId, photo)
-                    rendition:recordPublishedPhotoId(remoteId)
-                    rendition:recordPublishedPhotoUrl(baseUrl .. '/photos/' .. remoteId)
-                    if photoId then
-                        clearedPhotoIds[#clearedPhotoIds + 1] = photoId
-                        setSignature(photoId, currentSig)
-                        sigsSetCount = sigsSetCount + 1
-                    end
-                    cnReplace = cnReplace + 1
-                else
-                    log('    ✗ replace failed: ' .. tostring(err))
-                    rendition:uploadFailed(err)
-                    cnFail = cnFail + 1
-                end
-            else
-                -- UPLOAD-NEW PATH — first time this photo is sent to Immich.
-                log('    → UPLOAD-NEW path (POST /api/assets) — no remoteId on rendition')
-                local uuid, err = uploadNew(publishSettings, jpegPath, photo)
+            -- UPLOAD-NEW: first-time send, AND the self-heal fallback when a
+            -- republish targets a remote asset that's gone. Defined per-photo so
+            -- it closes over this rendition's locals. Returns true on success.
+            local function doUploadNew(reason)
+                log('    → UPLOAD-NEW path (POST /api/assets)' .. (reason and (' — ' .. reason) or ''))
+                local uuid, uerr = uploadNew(publishSettings, jpegPath, photo)
                 if uuid then
-                    doSyncTags(photo, uuid, 'upload-new')
+                    -- v0.10.0 UPLOAD-ONLY: no API tag sync. Immich extracts the
+                    -- embedded JPEG keywords (Keywords/Subject) on upload via
+                    -- handleMetadataExtraction → applyTagList (full mirror), with
+                    -- ZERO SidecarWrite jobs. The old doSyncTags() linked tags via
+                    -- /api/tags/{id}/assets, which queued a SidecarWrite per change
+                    -- → bad .xmp sidecars that shadowed the JPEG and corrupted dates.
                     pushTitleToDarkroom(publishSettings, uuid, photo)
                     rendition:recordPublishedPhotoId(uuid)
                     rendition:recordPublishedPhotoUrl(baseUrl .. '/photos/' .. uuid)
@@ -1201,10 +1174,51 @@ function provider.processRenderedPhotos(functionContext, exportContext)
                         sigsSetCount = sigsSetCount + 1
                     end
                     cnUpload = cnUpload + 1
+                    return true
                 else
+                    rendition:uploadFailed(uerr)
+                    cnFail = cnFail + 1
+                    return false
+                end
+            end
+
+            if remoteId and remoteId ~= '' then
+                -- v0.10.0 UPLOAD-ONLY: any republish re-uploads the rendered
+                -- JPEG bytes via REPLACE. There is no longer a metadata-only
+                -- PATCH path — the old PUT /api/assets/{id} + tag-sync APIs each
+                -- queued a SidecarWrite that wrote a bad .xmp, which Immich then
+                -- read in PREFERENCE to the embedded JPEG (corrupting dates →
+                -- midnight and dropping tags). Now ALL metadata (date/caption/
+                -- GPS/keywords) rides inside the JPEG and Immich extracts it on
+                -- upload with zero sidecar writes. The signature compare is gone
+                -- from routing: if LR flagged it for republish, the bytes changed,
+                -- so re-upload. (currentSig/storedSig still computed above; only
+                -- used now to refresh the stored signature for bookkeeping.)
+                log('    → REPLACE path (curl PUT to /api/assets/' .. remoteId .. '/original)')
+                local ok, err = replaceExisting(publishSettings, jpegPath, remoteId, photo)
+                if ok then
+                    log('    ✓ replace succeeded, recording remoteId+url')
+                    pushTitleToDarkroom(publishSettings, remoteId, photo)
+                    rendition:recordPublishedPhotoId(remoteId)
+                    rendition:recordPublishedPhotoUrl(baseUrl .. '/photos/' .. remoteId)
+                    if photoId then
+                        clearedPhotoIds[#clearedPhotoIds + 1] = photoId
+                        setSignature(photoId, currentSig)
+                        sigsSetCount = sigsSetCount + 1
+                    end
+                    cnReplace = cnReplace + 1
+                elseif remoteGone(remoteId) then
+                    -- v0.9.3: remote asset was deleted — self-heal to a fresh upload.
+                    log('    ↻ replace target ' .. remoteId .. ' is gone — self-healing to UPLOAD-NEW')
+                    doUploadNew('remote asset deleted server-side; re-uploading')
+                else
+                    log('    ✗ replace failed: ' .. tostring(err))
                     rendition:uploadFailed(err)
                     cnFail = cnFail + 1
                 end
+            else
+                -- UPLOAD-NEW PATH — first time this photo is sent to Immich.
+                doUploadNew('no remoteId on rendition')
             end
         end
 

@@ -1,5 +1,43 @@
 # lr-immich changelog
 
+## 0.10.0 — 2026-06-23 — UPLOAD-ONLY (kills the sidecar-corruption root cause)
+
+**The fix for the date-corruption + tag-drop disaster.** Proven against
+Immich v2.7.5 source + live data: every tag link/unlink (`PUT/DELETE
+/api/tags/{id}/assets`) and every metadata PATCH (`PUT /api/assets/{id}`
+with exif) queued an Immich **`SidecarWrite`** job. Those jobs wrote `.xmp`
+sidecars carrying a partial tag set + a midnight date — and **Immich reads
+the `.xmp` sidecar in preference to the embedded JPEG metadata**, so the bad
+sidecar permanently shadowed the (correct) embedded data: dates collapsed to
+00:00 and tags dropped on every re-extraction. 280 assets (film + digital)
+had been corrupted this way; all remediated server-side 2026-06-23.
+
+The JPEGs always embedded the COMPLETE keyword set + correct DateTimeOriginal.
+Immich's own metadata extraction reads them (`getTagList` → `applyTagList` →
+`replaceAssetTags`, a full add/remove mirror) with **zero** sidecar writes.
+So the plugin now rides entirely on that path.
+
+Changes:
+- **`publishServiceProvider.lua`**: removed all `doSyncTags()` calls and the
+  entire METADATA-ONLY (`patchMetadata`) branch. Routing is now simply:
+  `remoteId → REPLACE` (re-upload bytes), `no remoteId → UPLOAD-NEW`. All
+  metadata (date/caption/GPS/keywords) travels inside the JPEG; Immich
+  extracts it on upload. `pushTitleToDarkroom` kept (Darkroom, not Immich —
+  no sidecar). `syncTags`/`patchMetadata`/`doSyncTags`/`cnMeta` + the
+  start-of-run tag-cache fetch are now dead code (left in place, unused).
+- **`pushSelected.lua`**: "Push Selected to Immich" was a metadata-only PATCH
+  + tag-sync (same sidecar trigger). Now it re-renders the selected
+  (already-published) photos via `LrExportSession` and re-uploads the bytes
+  via REPLACE (UUID preserved) — so it honors develop changes too and never
+  writes a sidecar. Unpublished selections are skipped (use regular Publish).
+  Ported `buildMultipart`/`uploadNewAsset`/`replaceAsset` helpers in.
+
+Trade-off (accepted): metadata-only edits now re-render + re-upload (~5–35s,
+creates a trashed shadow) instead of the old ~1s PATCH. New rolls are
+unaffected (upload-new anyway). Follow-ups: trashed-shadow auto-cleanup after
+REPLACE; Immich **v3** removes `PUT /assets/{id}/original` so REPLACE needs
+reworking eventually.
+
 ## 0.9.2 — 2026-06-10
 
 Per-tag resilience in `syncTags`. A single unresolvable keyword no longer
