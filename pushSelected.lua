@@ -48,7 +48,7 @@ local LOG_PATH  = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.10.0] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [pushSelected/v0.10.1] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -500,12 +500,47 @@ local function replaceAsset(url, apiKey, deviceId, jpegPath, remoteId, lrPhoto)
         '>', shellEscape(logPath), '2>&1',
     }, ' ')
     local rc = execResilient(cmd, 'replace ' .. remoteId)
-    if rc == 0 then return true, nil end
+    if rc == 0 then
+        -- v0.10.1: parse the trashed-shadow id from the replace response
+        -- ({"status":"replaced","id":"<shadowId>"}) for cleanup. Only on 'replaced'.
+        local shadowId = nil
+        local rf = io.open(logPath, 'r')
+        if rf then
+            local rbody = rf:read('*a') or ''; rf:close()
+            if rbody:match('"status"%s*:%s*"replaced"') then
+                shadowId = rbody:match('"id"%s*:%s*"([^"]+)"')
+            end
+        end
+        return true, nil, shadowId
+    end
     local detail = ''
     local f = io.open(logPath, 'r')
     if f then detail = f:read('*a') or ''; f:close() end
     return false, string.format('PUT /api/assets/%s/original failed (curl exit %d).\n%s',
         remoteId, rc, detail)
+end
+
+-- v0.10.1: purge the trashed shadow a REPLACE leaves behind (mirrors
+-- publishServiceProvider.lua deleteShadow). GET-guard: force-delete ONLY if the
+-- asset reports isTrashed=true, so a stale/mis-parsed id can't touch a live asset.
+local function deleteShadow(url, apiKey, shadowId)
+    if not shadowId or shadowId == '' then return end
+    local gstatus, gbody = curlJson('GET', url .. '/api/assets/' .. shadowId, apiKey, nil)
+    if gstatus ~= 200 then
+        log('    shadow-cleanup: GET ' .. shadowId .. ' status=' .. tostring(gstatus) .. ' — skip')
+        return
+    end
+    if not (gbody and gbody:match('"isTrashed"%s*:%s*true')) then
+        log('    shadow-cleanup: ' .. shadowId .. ' not trashed — SKIP delete (safety guard)')
+        return
+    end
+    local dstatus, dbody = curlJson('DELETE', url .. '/api/assets', apiKey,
+        '{"ids":["' .. shadowId .. '"],"force":true}')
+    if dstatus == 200 or dstatus == 204 then
+        log('    shadow-cleanup: ✓ purged trashed shadow ' .. shadowId)
+    else
+        log('    shadow-cleanup: DELETE status=' .. tostring(dstatus) .. ' body=' .. tostring(dbody))
+    end
 end
 
 local function pushSelected()
@@ -620,9 +655,10 @@ local function pushSelected()
                 stats.failed = stats.failed + 1
             elseif entry then
                 log(string.format('  %s: REPLACE → PUT /api/assets/%s/original', fileName, entry.remoteId))
-                local ok, err = replaceAsset(url, apiKey, deviceId, pathOrMsg, entry.remoteId, photo)
+                local ok, err, shadowId = replaceAsset(url, apiKey, deviceId, pathOrMsg, entry.remoteId, photo)
                 if ok then
                     log('    ✓ re-uploaded (Immich will re-extract embedded metadata)')
+                    deleteShadow(url, apiKey, shadowId)  -- v0.10.1: purge the trashed copy
                     stats.replaced = stats.replaced + 1
                     clearedEntries[#clearedEntries + 1] = {
                         photoId = pid, collectionId = entry.collectionId,

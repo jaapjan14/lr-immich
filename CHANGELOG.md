@@ -1,5 +1,27 @@
 # lr-immich changelog
 
+## 0.10.1 — 2026-06-23 — auto-purge the REPLACE trashed-shadow
+
+Under upload-only (0.10.0) every republish is a REPLACE, and Immich's
+`PUT /assets/{id}/original` copies the OLD version, trashes the copy, and
+returns `{"status":"replaced","id":"<shadowId>"}`. Left alone, trash grows one
+asset per edit. The plugin now parses that shadow id and permanently deletes
+it after each successful REPLACE (`DELETE /api/assets {ids,force:true}`).
+
+**Safety guard:** before force-deleting, it `GET`s the asset and deletes ONLY
+if the response reports `isTrashed:true`. The live asset (`remoteId`) is active,
+not trashed, so even a mis-parsed/stale id can never nuke a live asset — the
+guard skips it. Best-effort: any cleanup failure logs and is ignored, never
+failing the publish.
+
+- `publishServiceProvider.lua`: `replaceExisting` now returns the shadow id;
+  new `deleteShadow()` helper; REPLACE branch calls it.
+- `pushSelected.lua`: same — `replaceAsset` returns the shadow id, mirrored
+  `deleteShadow()` runs after each re-upload.
+
+(The 126 pre-existing shadows were already purged server-side 2026-06-23 via
+the same `isTrashed`-guarded force-delete.)
+
 ## 0.10.0 — 2026-06-23 — UPLOAD-ONLY (kills the sidecar-corruption root cause)
 
 **The fix for the date-corruption + tag-drop disaster.** Proven against

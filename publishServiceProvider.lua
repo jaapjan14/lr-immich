@@ -25,7 +25,7 @@ local LOG_PATH = '/tmp/lr-immich.log'
 local function log(msg)
     local f = io.open(LOG_PATH, 'a')
     if f then
-        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.10.0] ' .. tostring(msg) .. '\n')
+        f:write(os.date('%Y-%m-%d %H:%M:%S') .. ' [v0.10.1] ' .. tostring(msg) .. '\n')
         f:close()
     end
 end
@@ -559,7 +559,20 @@ local function replaceExisting(publishSettings, jpegPath, remoteId, lrPhoto)
     -- twice is idempotent, so a retry is always safe.
     local rc = execResilient(cmd, 'replace ' .. remoteId)
     if rc == 0 then
-        return true, nil
+        -- v0.10.1: parse the replace response to find the trashed shadow it
+        -- created. Immich's replaceAsset COPIES the old version, trashes the
+        -- copy, and returns {"status":"replaced","id":"<shadowId>"}. We return
+        -- that id so the caller can purge the shadow (see deleteShadow). Only
+        -- when status=='replaced' — a 'duplicate' id is NOT a shadow.
+        local shadowId = nil
+        local rf = io.open(logPath, 'r')
+        if rf then
+            local rbody = rf:read('*a') or ''; rf:close()
+            if rbody:match('"status"%s*:%s*"replaced"') then
+                shadowId = rbody:match('"id"%s*:%s*"([^"]+)"')
+            end
+        end
+        return true, nil, shadowId
     end
     -- Read curl output for diagnostics
     local detail = ''
@@ -569,6 +582,38 @@ local function replaceExisting(publishSettings, jpegPath, remoteId, lrPhoto)
     return false, string.format(
         'PUT /api/assets/%s/original failed (curl exit %d).\n%s',
         remoteId, rc, detail)
+end
+
+-- v0.10.1: permanently delete the trashed shadow a REPLACE leaves behind.
+-- Immich's PUT /assets/{id}/original copies the OLD version, trashes the copy,
+-- and returns its id (parsed by replaceExisting). Under upload-only every
+-- republish is a REPLACE, so without this, trash grows one asset per edit.
+-- SAFETY: we GET the asset first and force-delete ONLY if it reports
+-- isTrashed=true — so a mis-parsed/stale id can never nuke a live asset (the
+-- live remoteId is active, not trashed, so the guard would skip it). Best-
+-- effort: any failure logs and is ignored — it never fails the publish.
+local function deleteShadow(publishSettings, shadowId)
+    if not shadowId or shadowId == '' then return end
+    local url = normalizeUrl(publishSettings.immichBaseUrl)
+    local apiKey = getApiKey(publishSettings)
+    if url == '' or not apiKey or apiKey == '' then return end
+
+    local gstatus, gbody = curlJson('GET', url .. '/api/assets/' .. shadowId, apiKey, nil)
+    if gstatus ~= 200 then
+        log('    shadow-cleanup: GET ' .. shadowId .. ' status=' .. tostring(gstatus) .. ' — skip')
+        return
+    end
+    if not (gbody and gbody:match('"isTrashed"%s*:%s*true')) then
+        log('    shadow-cleanup: ' .. shadowId .. ' not trashed — SKIP delete (safety guard)')
+        return
+    end
+    local dstatus, dbody = curlJson('DELETE', url .. '/api/assets', apiKey,
+        '{"ids":["' .. shadowId .. '"],"force":true}')
+    if dstatus == 200 or dstatus == 204 then
+        log('    shadow-cleanup: ✓ purged trashed shadow ' .. shadowId)
+    else
+        log('    shadow-cleanup: DELETE status=' .. tostring(dstatus) .. ' body=' .. tostring(dbody))
+    end
 end
 
 ----------------------------------------------------------------------------
@@ -1195,9 +1240,10 @@ function provider.processRenderedPhotos(functionContext, exportContext)
                 -- so re-upload. (currentSig/storedSig still computed above; only
                 -- used now to refresh the stored signature for bookkeeping.)
                 log('    → REPLACE path (curl PUT to /api/assets/' .. remoteId .. '/original)')
-                local ok, err = replaceExisting(publishSettings, jpegPath, remoteId, photo)
+                local ok, err, shadowId = replaceExisting(publishSettings, jpegPath, remoteId, photo)
                 if ok then
                     log('    ✓ replace succeeded, recording remoteId+url')
+                    deleteShadow(publishSettings, shadowId)  -- v0.10.1: purge the trashed copy
                     pushTitleToDarkroom(publishSettings, remoteId, photo)
                     rendition:recordPublishedPhotoId(remoteId)
                     rendition:recordPublishedPhotoUrl(baseUrl .. '/photos/' .. remoteId)
